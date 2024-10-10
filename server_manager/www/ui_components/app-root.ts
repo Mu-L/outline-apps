@@ -361,21 +361,6 @@ export class AppRoot extends polymerElementWithLocalize {
       .side-bar-section > .server-icon {
         margin: 0;
       }
-      #getConnectedDialog {
-        height: 562px;
-        background: white;
-      }
-      #getConnectedDialog iframe {
-        padding: 0;
-        margin: 0;
-        width: 100%;
-        border: none;
-        border-bottom: 1px solid #ccc;
-        height: 500px;
-      }
-      #getConnectedDialog .buttons {
-        margin-top: -5px; /* undo spacing added after iframe */
-      }
       @media (max-width: 887px) {
         .app-container {
           margin-left: 50px;
@@ -417,10 +402,10 @@ export class AppRoot extends polymerElementWithLocalize {
               </a>
             </if-messages>
             <span on-tap="maybeCloseDrawer"><a href="https://support.getoutline.org/s/article/Data-collection">[[localize('nav-data-collection')]]</a></span>
-            <template is="dom-if" if="{{contactViewFeatureFlag}}">
+            <template is="dom-if" if="{{featureFlags.contactView}}">
               <span on-tap="submitFeedbackTapped">[[localize('nav-contact-us')]]</span>
             </template>
-            <template is="dom-if" if="{{!contactViewFeatureFlag}}">
+            <template is="dom-if" if="{{!featureFlags.contactView}}">
               <span on-tap="submitFeedbackTapped">[[localize('nav-feedback')]]</span>
             </template>
             <span on-tap="maybeCloseDrawer"><a href="https://support.getoutline.org/">[[localize('nav-help')]]</a></span>
@@ -449,7 +434,7 @@ export class AppRoot extends polymerElementWithLocalize {
               <outline-manual-server-entry id="manualEntry" localize="[[localize]]"></outline-manual-server-entry>
               <!-- TODO: Move to a new outline-do-oauth-step. -->
               <outline-region-picker-step id="regionPicker" localize="[[localize]]" language="[[language]]"></outline-region-picker-step>
-              <outline-server-list id="serverView" server-list="[[_serverViewList(serverList)]]" selected-server-id="[[selectedServerId]]" language="[[language]]" localize="[[localize]]"></outline-server-list>
+              <outline-server-list id="serverView" server-list="[[_serverViewList(serverList)]]" selected-server-id="[[selectedServerId]]" language="[[language]]" localize="[[localize]]" feature-flags="[[featureFlags]]"></outline-server-list>
               </div>
             </iron-pages>
           </div>
@@ -477,7 +462,7 @@ export class AppRoot extends polymerElementWithLocalize {
 
       <!-- Modal dialogs must be outside the app container; otherwise the backdrop covers them.  -->
       <outline-survey-dialog id="surveyDialog" localize="[[localize]]"></outline-survey-dialog>
-      <template is="dom-if" if="{{contactViewFeatureFlag}}">
+      <template is="dom-if" if="{{featureFlags.contactView}}">
         <outline-contact-us-dialog
           id="feedbackDialog"
           localize="[[localize]]"
@@ -485,7 +470,7 @@ export class AppRoot extends polymerElementWithLocalize {
           on-error="showContactErrorToast"
         ></outline-contact-us-dialog>
       </template>
-      <template is="dom-if" if="{{!contactViewFeatureFlag}}">
+      <template is="dom-if" if="{{!featureFlags.contactView}}">
         <outline-feedback-dialog id="feedbackDialog" localize="[[localize]]"></outline-feedback-dialog>
       </template>
       <outline-about-dialog id="aboutDialog" outline-version="[[outlineVersion]]" localize="[[localize]]"></outline-about-dialog>
@@ -493,13 +478,6 @@ export class AppRoot extends polymerElementWithLocalize {
       <outline-share-dialog id="shareDialog" localize="[[localize]]"></outline-share-dialog>
       <outline-metrics-option-dialog id="metricsDialog" localize="[[localize]]"></outline-metrics-option-dialog>
       <outline-per-key-data-limit-dialog id="perKeyDataLimitDialog" language="[[language]]" localize="[[localize]]"></outline-per-key-data-limit-dialog>
-
-      <paper-dialog id="getConnectedDialog" modal="">
-        <!-- iframe gets inserted here once we are given the invite URL. -->
-        <div class="buttons">
-          <paper-button on-tap="closeGetConnectedDialog" autofocus="">[[localize('close')]]</paper-button>
-        </div>
-      </paper-dialog>
 
       <paper-dialog id="licenses" modal="" restorefocusonclose="">
         <paper-dialog-scrollable>
@@ -754,9 +732,12 @@ export class AppRoot extends polymerElementWithLocalize {
       },
       shouldShowSideBar: {type: Boolean},
       showManagerResourcesLink: {type: Boolean},
-      contactViewFeatureFlag: {
-        type: Boolean,
-        value: false,
+      featureFlags: {
+        type: Object,
+        value: {
+          contactView: true,
+          serverMetricsTab: false,
+        },
       },
     };
   }
@@ -1093,8 +1074,8 @@ export class AppRoot extends polymerElementWithLocalize {
     ).open(prepopulatedMessage, true);
   }
 
-  openShareDialog(accessKey: string, s3Url: string) {
-    (this.$.shareDialog as OutlineShareDialog).open(accessKey, s3Url);
+  openShareDialog(accessKey: string) {
+    (this.$.shareDialog as OutlineShareDialog).open(accessKey);
   }
 
   openPerKeyDataLimitDialog(
@@ -1110,28 +1091,6 @@ export class AppRoot extends polymerElementWithLocalize {
       onDataLimitSet,
       onDataLimitRemoved
     );
-  }
-
-  openGetConnectedDialog(inviteUrl: string) {
-    const dialog = this.$.getConnectedDialog as PaperDialogElement;
-    if (dialog.children.length > 1) {
-      return; // The iframe is already loading.
-    }
-    // Reset the iframe's state, by replacing it with a newly constructed
-    // iframe. Unfortunately the location.reload API does not work in our case due to
-    // this Chrome error:
-    // "Blocked a frame with origin "outline://web_app" from accessing a cross-origin frame."
-    const iframe = document.createElement('iframe');
-    iframe.onload = () => dialog.open();
-    iframe.src = inviteUrl;
-    dialog.insertBefore(iframe, dialog.children[0]);
-  }
-
-  closeGetConnectedDialog() {
-    const dialog = this.$.getConnectedDialog as PaperDialogElement;
-    dialog.close();
-    const oldIframe = dialog.children[0];
-    dialog.removeChild(oldIframe);
   }
 
   showMetricsDialogForNewServer() {

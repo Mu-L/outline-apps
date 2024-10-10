@@ -29,13 +29,14 @@ let package = Package(
     ],
     products: [
         .library(
+            // OutlineAppleLib is used by the Cordova plugin
             name: "OutlineAppleLib",
-            targets: ["OutlineSentryLogger", "OutlineTunnel", "OutlineCatalystApp", "OutlineNotification"]
+            targets: ["OutlineSentryLogger", "OutlineTunnel", "OutlineCatalystApp", "OutlineNotification", "OutlineError"]
         ),
-        // Expose OutlineTunnel so the VpnExtension can use it.
         .library(
-            name: "OutlineTunnel",
-            targets: ["OutlineTunnel"]
+            // OutlineVPNExtensionLib is used by the VPN extension
+            name: "OutlineVPNExtensionLib",
+            targets: ["OutlineError"]
         ),
     ],
     dependencies: [
@@ -50,6 +51,7 @@ let package = Package(
                 "OutlineNotification",
             ]
         ),
+        .target(name: "OutlineError"),
         .target(name: "OutlineNotification"),
         .target(
             name: "OutlineSentryLogger",
@@ -63,10 +65,6 @@ let package = Package(
             dependencies: [
                 .product(name: "CocoaLumberjackSwift", package: "CocoaLumberjack"),
             ]
-        ),
-        .testTarget(
-            name: "OutlineTunnelTest",
-            dependencies: ["OutlineTunnel"]
         ),
     ]
 )

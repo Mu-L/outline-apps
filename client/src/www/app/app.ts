@@ -25,7 +25,10 @@ import {UrlInterceptor} from './url_interceptor';
 import {VpnInstaller} from './vpn_installer';
 import * as errors from '../model/errors';
 import * as events from '../model/events';
-import {PlatformError} from '../model/platform_error';
+import {
+  PlatformError,
+  ROUTING_SERVICE_NOT_RUNNING,
+} from '../model/platform_error';
 import {Server} from '../model/server';
 import {OutlineErrorReporter} from '../shared/error_reporter';
 import {ServerConnectionState, ServerListItem} from '../views/servers_view';
@@ -133,6 +136,19 @@ export class App {
       this.requestPromptAddServer.bind(this)
     );
     this.rootEl.addEventListener(
+      'ShowAddServerDialog',
+      this.showAddServerDialog.bind(this)
+    );
+    this.rootEl.addEventListener(
+      'ShowNavigation',
+      this.showNavigation.bind(this)
+    );
+    this.rootEl.addEventListener(
+      'HideNavigation',
+      this.hideNavigation.bind(this)
+    );
+    this.rootEl.addEventListener('ChangePage', this.changePage.bind(this));
+    this.rootEl.addEventListener(
       'AddServerConfirmationRequested',
       this.requestAddServerConfirmation.bind(this)
     );
@@ -164,10 +180,6 @@ export class App {
     this.rootEl.addEventListener(
       'AutoConnectDialogDismissed',
       this.autoConnectDialogDismissed.bind(this)
-    );
-    this.rootEl.addEventListener(
-      'ShowServerRename',
-      this.rootEl.showServerRename.bind(this.rootEl)
     );
     this.rootEl.addEventListener(
       'PrivacyTermsAcked',
@@ -216,8 +228,9 @@ export class App {
 
     if (!this.arePrivacyTermsAcked()) {
       this.displayPrivacyView();
+    } else if (this.rootEl.$.serversView.shouldShowZeroState) {
+      this.rootEl.$.addServerView.open = true;
     }
-    this.displayZeroStateUi();
   }
 
   showLocalizedError(error?: Error, toastDuration = 10000) {
@@ -246,10 +259,7 @@ export class App {
       toastMessage = this.localize('error-server-incompatible');
     } else if (error instanceof OperationTimedOut) {
       toastMessage = this.localize('error-timeout');
-    } else if (
-      error instanceof errors.ShadowsocksStartFailure &&
-      this.isWindows()
-    ) {
+    } else if (error instanceof errors.ClientStartFailure && this.isWindows()) {
       // Fall through to `error-unexpected` for other platforms.
       toastMessage = this.localize('outline-plugin-error-antivirus');
       buttonMessage = this.localize('fix-this');
@@ -350,12 +360,6 @@ export class App {
     }
   }
 
-  private displayZeroStateUi() {
-    if (this.rootEl.$.serversView.shouldShowZeroState) {
-      this.rootEl.$.addServerView.openAddServerSheet();
-    }
-  }
-
   private arePrivacyTermsAcked() {
     try {
       return this.settings.get(SettingsKey.PRIVACY_ACK) === 'true';
@@ -369,12 +373,14 @@ export class App {
 
   private displayPrivacyView() {
     this.rootEl.$.serversView.hidden = true;
-    this.rootEl.$.privacyView.hidden = false;
+    this.rootEl.$.privacyView.open = true;
+    this.rootEl.$.addServerView.open = false;
   }
 
   private ackPrivacyTerms() {
     this.rootEl.$.serversView.hidden = false;
-    this.rootEl.$.privacyView.hidden = true;
+    this.rootEl.$.privacyView.open = false;
+    this.rootEl.$.addServerView.open = true;
     this.settings.set(SettingsKey.PRIVACY_ACK, 'true');
   }
 
@@ -383,6 +389,22 @@ export class App {
     window.localStorage.setItem('overrideLanguage', languageCode);
     this.rootEl.setLanguage(languageCode);
     this.changeToDefaultPage();
+  }
+
+  private showAddServerDialog() {
+    this.rootEl.$.addServerView.open = true;
+  }
+
+  private showNavigation() {
+    this.rootEl.$.drawer.open = true;
+  }
+
+  private hideNavigation() {
+    this.rootEl.$.drawer.open = false;
+  }
+
+  private changePage(event: CustomEvent) {
+    this.rootEl.changePage(event.detail.page);
   }
 
   private handleClipboardText(text: string) {
@@ -409,6 +431,7 @@ export class App {
   private requestIgnoreServer(event: CustomEvent) {
     const accessKey = event.detail.accessKey;
     this.ignoredAccessKeys[accessKey] = true;
+    this.rootEl.$.addServerView.open = false;
   }
 
   private requestAddServer(event: CustomEvent) {
@@ -417,6 +440,8 @@ export class App {
     } catch (err) {
       this.changeToDefaultPage();
       this.showLocalizedError(err);
+    } finally {
+      this.rootEl.$.addServerView.open = false;
     }
   }
 
@@ -427,15 +452,14 @@ export class App {
       this.confirmAddServer(accessKey);
     } catch (err) {
       console.error('Failed to confirm add sever.', err);
-      const addServerView = this.rootEl.$.addServerView;
-      addServerView.$.accessKeyInput.invalid = true;
+      this.showLocalizedError(err);
     }
   }
 
   private confirmAddServer(accessKey: string, fromClipboard = false) {
     const addServerView = this.rootEl.$.addServerView;
     accessKey = unwrapInvite(accessKey);
-    if (fromClipboard && !addServerView.isAddingServer()) {
+    if (fromClipboard && !addServerView.open) {
       if (accessKey in this.ignoredAccessKeys) {
         return console.debug('Ignoring access key');
       } else if (accessKey.startsWith('https://')) {
@@ -446,11 +470,12 @@ export class App {
     }
     try {
       this.serverRepo.validateAccessKey(accessKey);
-      addServerView.openAddServerConfirmationSheet(accessKey);
+      addServerView.accessKey = accessKey;
+      addServerView.open = true;
     } catch (e) {
       if (!fromClipboard && e instanceof errors.ServerAlreadyAdded) {
         // Display error message and don't propagate error if this is not a clipboard add.
-        addServerView.close();
+        addServerView.open = false;
         this.showLocalizedError(e);
         return;
       }
@@ -521,12 +546,15 @@ export class App {
         connectionState: ServerConnectionState.DISCONNECTED,
       });
       console.error(`could not connect to server ${serverId}: ${e}`);
-      if (e instanceof errors.SystemConfigurationException) {
-        if (
-          await this.showConfirmationDialog(
-            this.localize('outline-services-installation-confirmation')
-          )
-        ) {
+      if (
+        e instanceof PlatformError &&
+        e.code === ROUTING_SERVICE_NOT_RUNNING
+      ) {
+        const confirmation =
+          this.localize('outline-services-installation-confirmation') +
+          '\n\n--------------------\n' +
+          e.toString();
+        if (await this.showConfirmationDialog(confirmation)) {
           await this.installVpnService();
           return;
         }
@@ -567,12 +595,13 @@ export class App {
       );
     }
     if (!dismissed) {
-      this.rootEl.$.autoConnectDialog.show();
+      this.rootEl.$.autoConnectDialog.open = true;
     }
   }
 
   private autoConnectDialogDismissed() {
     this.settings.set(SettingsKey.AUTO_CONNECT_DIALOG_DISMISSED, 'true');
+    this.rootEl.$.autoConnectDialog.open = false;
   }
 
   private async disconnectServer(event: CustomEvent) {

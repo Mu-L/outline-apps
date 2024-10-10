@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -25,14 +26,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Jigsaw-Code/outline-apps/client/go/outline/neterrors"
+	"github.com/Jigsaw-Code/outline-apps/client/go/outline"
 	"github.com/Jigsaw-Code/outline-apps/client/go/outline/platerrors"
-	"github.com/Jigsaw-Code/outline-apps/client/go/outline/shadowsocks"
 	"github.com/Jigsaw-Code/outline-apps/client/go/outline/tun2socks"
 	_ "github.com/eycorsican/go-tun2socks/common/log/simple" // Register a simple logger.
 	"github.com/eycorsican/go-tun2socks/core"
 	"github.com/eycorsican/go-tun2socks/proxy/dnsfallback"
 	"github.com/eycorsican/go-tun2socks/tun"
+)
+
+// tun2socks exit codes. Must be kept in sync with definitions in "go_vpn_tunnel.ts"
+// TODO: replace exit code with structured JSON output
+const (
+	exitCodeSuccess = 0
+	exitCodeFailure = 1
 )
 
 const (
@@ -43,6 +50,12 @@ const (
 
 var logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 
+// The result JSON containing two error strings when "--checkConnectivity".
+type CheckConnectivityResult struct {
+	TCPErrorJson string `json:"tcp"`
+	UDPErrorJson string `json:"udp"`
+}
+
 var args struct {
 	tunAddr *string
 	tunGw   *string
@@ -50,14 +63,7 @@ var args struct {
 	tunName *string
 	tunDNS  *string
 
-	// Deprecated: Use proxyConfig instead.
-	proxyHost     *string
-	proxyPort     *int
-	proxyPassword *string
-	proxyCipher   *string
-	proxyPrefix   *string
-
-	proxyConfig *string
+	transportConfig *string
 
 	logLevel          *string
 	checkConnectivity *bool
@@ -78,12 +84,7 @@ func main() {
 	args.tunMask = flag.String("tunMask", "255.255.255.0", "TUN interface network mask; prefixlen for IPv6")
 	args.tunDNS = flag.String("tunDNS", "1.1.1.1,9.9.9.9,208.67.222.222", "Comma-separated list of DNS resolvers for the TUN interface (Windows only)")
 	args.tunName = flag.String("tunName", "tun0", "TUN interface name")
-	args.proxyHost = flag.String("proxyHost", "", "Shadowsocks proxy hostname or IP address")
-	args.proxyPort = flag.Int("proxyPort", 0, "Shadowsocks proxy port number")
-	args.proxyPassword = flag.String("proxyPassword", "", "Shadowsocks proxy password")
-	args.proxyCipher = flag.String("proxyCipher", "chacha20-ietf-poly1305", "Shadowsocks proxy encryption cipher")
-	args.proxyPrefix = flag.String("proxyPrefix", "", "Shadowsocks connection prefix, UTF8-encoded (unsafe)")
-	args.proxyConfig = flag.String("proxyConfig", "", "A JSON object containing the proxy config, UTF8-encoded")
+	args.transportConfig = flag.String("transport", "", "A JSON object containing the transport config, UTF8-encoded")
 	args.logLevel = flag.String("logLevel", "info", "Logging level: debug|info|warn|error|none")
 	args.dnsFallback = flag.Bool("dnsFallback", false, "Enable DNS fallback over TCP (overrides the UDP handler).")
 	args.checkConnectivity = flag.Bool("checkConnectivity", false, "Check the proxy TCP and UDP connectivity and exit.")
@@ -93,25 +94,43 @@ func main() {
 
 	if *args.version {
 		fmt.Println(version)
-		os.Exit(0)
+		os.Exit(exitCodeSuccess)
 	}
 
 	setLogLevel(*args.logLevel)
 
-	client, err := newShadowsocksClientFromArgs()
-	if err != nil {
-		printErrorAndExit(err, 1)
+	if len(*args.transportConfig) == 0 {
+		printErrorAndExit(platerrors.PlatformError{Code: platerrors.IllegalConfig, Message: "transport config missing"}, exitCodeFailure)
 	}
+	clientResult := outline.NewClient(*args.transportConfig)
+	if clientResult.Error != nil {
+		printErrorAndExit(clientResult.Error, exitCodeFailure)
+	}
+	client := clientResult.Client
 
 	if *args.checkConnectivity {
-		checkConnectivityAndExit(client)
+		result := outline.CheckTCPAndUDPConnectivity(client)
+		output := CheckConnectivityResult{
+			TCPErrorJson: marshalErrorToJSON(result.TCPError),
+			UDPErrorJson: marshalErrorToJSON(result.UDPError),
+		}
+		jsonBytes, err := json.Marshal(output)
+		if err != nil {
+			printErrorAndExit(err, exitCodeFailure)
+		}
+		fmt.Println(string(jsonBytes))
+		os.Exit(exitCodeSuccess)
 	}
 
 	// Open TUN device
 	dnsResolvers := strings.Split(*args.tunDNS, ",")
 	tunDevice, err := tun.OpenTunDevice(*args.tunName, *args.tunAddr, *args.tunGw, *args.tunMask, dnsResolvers, persistTun)
 	if err != nil {
-		printErrorAndExit(platerrors.NewWithCause(platerrors.SetupSystemVPNFailed, "failed to open TUN device", err), 1)
+		printErrorAndExit(platerrors.PlatformError{
+			Code:    platerrors.SetupSystemVPNFailed,
+			Message: "failed to open TUN device",
+			Cause:   platerrors.ToPlatformError(err),
+		}, exitCodeFailure)
 	}
 	// Output packets to TUN device
 	core.RegisterOutputFn(tunDevice.Write)
@@ -131,8 +150,11 @@ func main() {
 	go func() {
 		_, err := io.CopyBuffer(lwipWriter, tunDevice, make([]byte, mtu))
 		if err != nil {
-			printErrorAndExit(platerrors.NewWithCause(platerrors.DataTransmissionFailed,
-				"failed to write data to network stack", err), 1)
+			printErrorAndExit(platerrors.PlatformError{
+				Code:    platerrors.DataTransmissionFailed,
+				Message: "failed to write data to network stack",
+				Cause:   platerrors.ToPlatformError(err),
+			}, exitCodeFailure)
 		}
 	}()
 
@@ -140,9 +162,9 @@ func main() {
 	logger.Info("tun2socks running...")
 
 	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	sig := <-osSignals
-	logger.Debug("Received signal", sig)
+	logger.Debug("Received signal", "signal", sig)
 }
 
 func setLogLevel(level string) {
@@ -163,51 +185,20 @@ func setLogLevel(level string) {
 	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slvl}))
 }
 
-func printErrorAndExit(err error, exitCode int) {
-	fmt.Fprintln(os.Stderr, err.Error())
-	os.Exit(exitCode)
-}
-
-// newShadowsocksClientFromArgs creates a new shadowsocks.Client instance
-// from the global CLI argument object args.
-func newShadowsocksClientFromArgs() (*shadowsocks.Client, error) {
-	if jsonConfig := *args.proxyConfig; len(jsonConfig) > 0 {
-		return shadowsocks.NewClientFromJSON(jsonConfig)
-	} else {
-		// legacy raw flags
-		config := shadowsocks.Config{
-			Host:       *args.proxyHost,
-			Port:       *args.proxyPort,
-			CipherName: *args.proxyCipher,
-			Password:   *args.proxyPassword,
-		}
-		prefixBytes, err := shadowsocks.ParseConfigPrefixFromString(*args.proxyPrefix)
-		if err != nil {
-			return nil, err
-		}
-		config.Prefix = prefixBytes
-		return shadowsocks.NewClient(&config)
+func marshalErrorToJSON(e error) string {
+	pe := platerrors.ToPlatformError(e)
+	if pe == nil {
+		return ""
 	}
-}
-
-// checkConnectivity checks whether the remote Shadowsocks server supports TCP or UDP,
-// and converts the neterrors to a PlatformError.
-// TODO: remove this function once we migrated CheckConnectivity to return a PlatformError.
-func checkConnectivityAndExit(c *shadowsocks.Client) {
-	connErrCode, err := shadowsocks.CheckConnectivity(c)
+	errJson, err := platerrors.MarshalJSONString(pe)
 	if err != nil {
-		printErrorAndExit(platerrors.NewWithCause(platerrors.InternalError, "failed to check connectivity", err), 1)
+		// TypeScript's PlatformError can unmarshal a raw string
+		return string(pe.Code)
 	}
-	switch connErrCode {
-	case neterrors.NoError.Number():
-		os.Exit(0)
-	case neterrors.AuthenticationFailure.Number():
-		printErrorAndExit(platerrors.New(platerrors.Unauthenticated, "authentication failed"), 1)
-	case neterrors.Unreachable.Number():
-		printErrorAndExit(platerrors.New(platerrors.ProxyServerUnreachable, "cannot connect to Shadowsocks server"), 1)
-	case neterrors.UDPConnectivity.Number():
-		printErrorAndExit(platerrors.New(platerrors.ProxyServerUDPUnsupported, "Shadowsocks server does not support UDP"),
-			neterrors.UDPConnectivity.Number())
-	}
-	printErrorAndExit(platerrors.New(platerrors.InternalError, "failed to check connectivity"), 1)
+	return errJson
+}
+
+func printErrorAndExit(e error, exitCode int) {
+	fmt.Fprintln(os.Stderr, marshalErrorToJSON(e))
+	os.Exit(exitCode)
 }
